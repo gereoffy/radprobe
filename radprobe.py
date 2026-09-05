@@ -41,6 +41,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import hmac
 import os
@@ -988,7 +989,29 @@ def print_certificates(der_certs: list[bytes]) -> None:
 # RADIUS conversation (UDP)
 # ----------------------------------------------------------------------------
 
+class _RadiusUdpProtocol(asyncio.DatagramProtocol):
+    """Collects incoming RADIUS datagrams into a queue for the async exchange."""
+
+    def __init__(self):
+        self.queue: asyncio.Queue = asyncio.Queue()
+
+    def datagram_received(self, data, addr):
+        self.queue.put_nowait(data)
+
+    def error_received(self, exc):
+        # e.g. ICMP port-unreachable; ignore and let the timeout/retry handle it
+        pass
+
+
 class RadiusConversation:
+    """Async RADIUS/UDP transport, used as an async context manager:
+
+        async with RadiusConversation(...) as conv:
+            code, attrs = await conv.send_eap(...)
+
+    Only the UDP send/receive is asynchronous; building and parsing packets is
+    synchronous CPU work."""
+
     def __init__(self, server, port, secret, nas_ip, timeout,
                  source_ip=None, extra_attrs=None, debug=False):
         self.server = server
@@ -996,23 +1019,49 @@ class RadiusConversation:
         self.secret = secret.encode()
         self.nas_ip = nas_ip
         self.timeout = timeout
+        self.source_ip = source_ip
         self.extra_attrs = extra_attrs or []
         self.debug = debug
         self.radius_id = os.urandom(1)[0]
         self.state: bytes | None = None
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        if source_ip:
-            try:
-                self.sock.bind((source_ip, 0))
-            except OSError as e:
-                raise RuntimeError(f"Could not bind to source address {source_ip}: {e}") from e
-        self.sock.settimeout(timeout)
+        self._transport = None
+        self._proto = None
+
+    async def __aenter__(self):
+        loop = asyncio.get_running_loop()
+        local_addr = (self.source_ip, 0) if self.source_ip else None
+        try:
+            self._transport, self._proto = await loop.create_datagram_endpoint(
+                _RadiusUdpProtocol, remote_addr=(self.server, self.port), local_addr=local_addr,
+            )
+        except OSError as e:
+            if self.source_ip:
+                raise RuntimeError(f"Could not bind to source address {self.source_ip}: {e}") from e
+            raise
+        return self
+
+    async def __aexit__(self, *exc):
+        if self._transport is not None:
+            self._transport.close()
 
     def _next_radius_id(self) -> int:
         self.radius_id = (self.radius_id + 1) % 256
         return self.radius_id
 
-    def send_eap(self, eap_packet, username="anonymous", retries=3):
+    async def _exchange(self, packet: bytes, retries: int) -> bytes:
+        last_err = None
+        for _ in range(retries):
+            self._transport.sendto(packet)
+            try:
+                return await asyncio.wait_for(self._proto.queue.get(), self.timeout)
+            except asyncio.TimeoutError as e:
+                last_err = e
+                continue
+        raise TimeoutError(
+            f"No reply from the RADIUS server ({self.server}:{self.port}) after {retries} attempts"
+        ) from last_err
+
+    async def send_eap(self, eap_packet, username="anonymous", retries=3):
         packet = build_access_request(
             self._next_radius_id(), self.secret, eap_packet, username, self.nas_ip, self.state,
             extra_attrs=self.extra_attrs,
@@ -1020,47 +1069,27 @@ class RadiusConversation:
         if self.debug:
             log(f"--> Access-Request ({len(packet)} byte)\n    EAP ({len(eap_packet)} byte): "
                   f"{eap_packet[:48].hex(' ')}...")
-        last_err = None
-        for _ in range(retries):
-            try:
-                self.sock.sendto(packet, (self.server, self.port))
-                data, _addr = self.sock.recvfrom(65535)
-                if self.debug:
-                    log(f"<-- reply ({len(data)} bytes, code={data[0]})")
-                code, ident, auth, attrs = parse_radius_packet(data)
-                new_state = get_state(attrs)
-                if new_state is not None:
-                    self.state = new_state
-                return code, attrs
-            except socket.timeout as e:
-                last_err = e
-                continue
-        raise TimeoutError(
-            f"No reply from the RADIUS server ({self.server}:{self.port}) after {retries} attempts"
-        ) from last_err
+        data = await self._exchange(packet, retries)
+        if self.debug:
+            log(f"<-- reply ({len(data)} bytes, code={data[0]})")
+        code, ident, auth, attrs = parse_radius_packet(data)
+        new_state = get_state(attrs)
+        if new_state is not None:
+            self.state = new_state
+        return code, attrs
 
-    def send_pap(self, username: str, password: str, retries: int = 3, encoding: str = "utf-8"):
+    async def send_pap(self, username: str, password: str, retries: int = 3, encoding: str = "utf-8"):
         packet = build_pap_access_request(
             self._next_radius_id(), self.secret, username, password, self.nas_ip,
             extra_attrs=self.extra_attrs, encoding=encoding,
         )
         if self.debug:
             log(f"--> Access-Request PAP ({len(packet)} byte), User-Name={username}")
-        last_err = None
-        for _ in range(retries):
-            try:
-                self.sock.sendto(packet, (self.server, self.port))
-                data, _addr = self.sock.recvfrom(65535)
-                if self.debug:
-                    log(f"<-- reply ({len(data)} bytes, code={data[0]})")
-                code, ident, auth, attrs = parse_radius_packet(data)
-                return code, attrs
-            except socket.timeout as e:
-                last_err = e
-                continue
-        raise TimeoutError(
-            f"No reply from the RADIUS server ({self.server}:{self.port}) after {retries} attempts"
-        ) from last_err
+        data = await self._exchange(packet, retries)
+        if self.debug:
+            log(f"<-- reply ({len(data)} bytes, code={data[0]})")
+        code, ident, auth, attrs = parse_radius_packet(data)
+        return code, attrs
 
 
 # ----------------------------------------------------------------------------
@@ -1107,7 +1136,7 @@ def inner_send(eap_type: int, tunnel: TlsTunnel, iident: int | None,
 # Main flow: handshake + inner tunnel
 # ----------------------------------------------------------------------------
 
-def run_tunnel(conv: RadiusConversation, eap_type: int, start_frame: EapPeapFrame, args) -> tuple[str, str]:
+async def run_tunnel(conv: RadiusConversation, eap_type: int, start_frame: EapPeapFrame, args) -> tuple[str, str]:
     verify = not args.unsafe_cert
     hostname = args.sni or None
     check_host = verify and hostname is not None
@@ -1149,7 +1178,7 @@ def run_tunnel(conv: RadiusConversation, eap_type: int, start_frame: EapPeapFram
             payload=pending_out,
             total_length=len(pending_out) if pending_out else None,
         )
-        code, attrs = conv.send_eap(reply, username=args.identity)
+        code, attrs = await conv.send_eap(reply, username=args.identity)
 
         if code == ACCESS_ACCEPT:
             log(f"\n>> ACCESS-ACCEPT (authentication succeeded). {accept_diagnostics(attrs)}")
@@ -1179,7 +1208,7 @@ def run_tunnel(conv: RadiusConversation, eap_type: int, start_frame: EapPeapFram
             if phase == "handshake":
                 cert_capture.extend(server_frame.payload)
             if server_frame.flags & FLAG_MORE_FRAGMENTS:
-                code, attrs = conv.send_eap(
+                code, attrs = await conv.send_eap(
                     build_eap_peap_response(server_frame.eap_id, eap_type, flags=0, payload=b""),
                     username=args.identity,
                 )
@@ -1377,7 +1406,7 @@ def _fmt_types(types: list[int]) -> str:
     return ", ".join(f"{EAP_TYPE_NAMES.get(t, '?')} ({t})" for t in types)
 
 
-def run_bare_mschapv2(conv: RadiusConversation, eap_bytes: bytes, args) -> tuple[str, str]:
+async def run_bare_mschapv2(conv: RadiusConversation, eap_bytes: bytes, args) -> tuple[str, str]:
     """Bare EAP-MSCHAPv2 (no TLS tunnel): the challenge/response goes directly in
     the outer EAP."""
     username = args.identity
@@ -1404,7 +1433,7 @@ def run_bare_mschapv2(conv: RadiusConversation, eap_bytes: bytes, args) -> tuple
             else:
                 log(">> MSCHAPv2 Success, but the server's 'S=' response could not be verified.")
         eap_resp = inner_eap_build(EAP_RESPONSE, iident, EAP_TYPE_MSCHAPV2, msdata)
-        code, attrs = conv.send_eap(eap_resp, username=args.identity)
+        code, attrs = await conv.send_eap(eap_resp, username=args.identity)
         if code == ACCESS_ACCEPT:
             log(f"\n>> ACCESS-ACCEPT (MSCHAPv2 succeeded). {accept_diagnostics(attrs)}")
             return RESULT_ACCESS, "Access-Accept: MSCHAPv2 succeeded"
@@ -1431,7 +1460,7 @@ def _build_request_attrs(args) -> tuple[str, list[tuple[int, bytes]] | None]:
     return nas_ip, (extra or None)
 
 
-def authenticate(
+async def authenticate_async(
     server,
     secret,
     *,
@@ -1480,20 +1509,32 @@ def authenticate(
     if extra_attrs:
         built_attrs = (built_attrs or []) + list(extra_attrs)
     try:
-        return probe(server, args, resolved_nas_ip, built_attrs or None)
+        return await probe(server, args, resolved_nas_ip, built_attrs or None)
     except (RuntimeError, ValueError, OSError) as e:
         return RESULT_ERROR, str(e)
 
 
-def probe(server, args, nas_ip, extra_attrs) -> tuple[str, str]:
+def authenticate(*args, **kwargs) -> tuple[str, str]:
+    """Synchronous wrapper around authenticate_async(): runs it to completion in a
+    fresh event loop via asyncio.run() and returns the (state, message) tuple.
+    Accepts exactly the same arguments as authenticate_async(). Do NOT call this
+    from within a running event loop (async code) - use authenticate_async() there."""
+    return asyncio.run(authenticate_async(*args, **kwargs))
+
+
+async def probe(server, args, nas_ip, extra_attrs) -> tuple[str, str]:
     try:
         "".encode(args.password_encoding)
     except LookupError:
         raise ValueError(f"unknown --password-encoding: {args.password_encoding!r}")
-    conv = RadiusConversation(
+    async with RadiusConversation(
         server, args.port, args.secret, nas_ip, args.timeout,
         source_ip=args.source_ip, extra_attrs=extra_attrs, debug=args.debug,
-    )
+    ) as conv:
+        return await _probe_conv(conv, args)
+
+
+async def _probe_conv(conv, args) -> tuple[str, str]:
 
     # Plain RADIUS PAP (no EAP): a single Access-Request with User-Name +
     # encrypted User-Password. This is the only method that sends no EAP at all,
@@ -1502,7 +1543,7 @@ def probe(server, args, nas_ip, extra_attrs) -> tuple[str, str]:
         if not args.password:
             raise RuntimeError("--auth pap needs --password (and --identity is the username).")
         log(f"Plain RADIUS PAP (no EAP), User-Name={args.identity}")
-        code, attrs = conv.send_pap(args.identity, args.password or "", encoding=args.password_encoding)
+        code, attrs = await conv.send_pap(args.identity, args.password or "", encoding=args.password_encoding)
         if code == ACCESS_ACCEPT:
             log(f"\n>> ACCESS-ACCEPT (PAP succeeded, the password is correct). {accept_diagnostics(attrs)}")
             return RESULT_ACCESS, "Access-Accept: PAP authentication succeeded"
@@ -1514,7 +1555,7 @@ def probe(server, args, nas_ip, extra_attrs) -> tuple[str, str]:
         return RESULT_ERROR, f"unexpected RADIUS response code {code}"
 
     # 1) EAP-Response/Identity -> starts the server's EAP/PEAP/TTLS flow.
-    code, attrs = conv.send_eap(build_eap_identity_response(1, args.identity), username=args.identity)
+    code, attrs = await conv.send_eap(build_eap_identity_response(1, args.identity), username=args.identity)
     if code == ACCESS_REJECT:
         raise RuntimeError(
             "The server rejected the connection immediately at the Identity (common causes: "
@@ -1542,7 +1583,7 @@ def probe(server, args, nas_ip, extra_attrs) -> tuple[str, str]:
             if not args.password:
                 raise RuntimeError("bare EAP-MSCHAPv2 needs --password (and --identity is the username).")
             log("Detected EAP type: EAP-MSCHAPv2 (26), bare (no tunnel).")
-            return run_bare_mschapv2(conv, eap_bytes, args)
+            return await run_bare_mschapv2(conv, eap_bytes, args)
         if otype in SUPPORTED_TLS_TUNNEL_TYPES and not want_mschap:
             frame = parse_eap_peap(eap_bytes)
             break
@@ -1556,14 +1597,14 @@ def probe(server, args, nas_ip, extra_attrs) -> tuple[str, str]:
                         return RESULT_NOAUTH, ("server offered bare EAP-MSCHAPv2 (26); "
                                                "pass a password to authenticate")
                     log("Auto: server-offered EAP-MSCHAPv2 (26), bare (no tunnel).")
-                    return run_bare_mschapv2(conv, eap_bytes, args)
+                    return await run_bare_mschapv2(conv, eap_bytes, args)
                 return RESULT_NOAUTH, (f"server offered {oname} ({otype}), which auto does not "
                                        "handle; use --auth peap|ttls|tls|mschapv2 to force one")
             raise RuntimeError("This is not a TLS-tunnel outer type, and --auth none is set. "
                                "Try: --auth peap|ttls|tls|mschapv2")
         log(f"  -> Nak: requesting {EAP_TYPE_NAMES.get(desired, desired)} ({desired})")
         naks_sent.append(otype)
-        code, attrs = conv.send_eap(build_eap_nak(oid, desired), username=args.identity)
+        code, attrs = await conv.send_eap(build_eap_nak(oid, desired), username=args.identity)
         if code == ACCESS_REJECT:
             raise RuntimeError(
                 f"The server rejected the Nak (for {EAP_TYPE_NAMES.get(desired, desired)}) - "
@@ -1581,7 +1622,7 @@ def probe(server, args, nas_ip, extra_attrs) -> tuple[str, str]:
     if eap_type == EAP_TYPE_TTLS and args.inner_auth == "pap" and not args.password:
         raise RuntimeError("TTLS/PAP needs --password (and --inner-identity is advisable).")
 
-    return run_tunnel(conv, eap_type, frame, args)
+    return await run_tunnel(conv, eap_type, frame, args)
 
 
 def main() -> None:

@@ -156,9 +156,31 @@ any network / TLS / configuration / protocol error is turned into
 the optional RADIUS attributes internally, so you do not need to construct those
 yourself.
 
-The lower-level `probe()` function does the same work but **may raise** on error
-(it is what `authenticate()` wraps); prefer `authenticate()` unless you want to
-handle exceptions yourself.
+### Async (asyncio)
+
+Internally the library is async: the only blocking part is the RADIUS UDP
+round-trip, and it is implemented with `asyncio`. `authenticate()` shown above is
+just a thin synchronous wrapper that runs the async version to completion with
+`asyncio.run()`. From async code (a Tornado/asyncio/FastAPI handler, etc.) call
+the coroutine directly with the exact same arguments, so a multi-second wait (or a
+timeout) never blocks the event loop:
+
+```python
+from radprobe import authenticate_async, RESULT_ACCESS
+
+state, message = await authenticate_async(
+    server, secret, auth="ttls", inner_auth="pap",
+    identity="anonymous@realm", inner_identity=user,
+    password=pw, sni="radius.example.org",
+)
+```
+
+`authenticate()` and `authenticate_async()` take identical parameters and both
+return the `(state, message)` tuple; `authenticate()` must **not** be called from
+within a running event loop (`asyncio.run()` forbids that) — use
+`authenticate_async()` there. The coroutine `probe()` is the async core that does
+the actual work and **may raise** on error; `authenticate_async()` wraps it and
+turns errors into `(RESULT_ERROR, message)`.
 
 ---
 
