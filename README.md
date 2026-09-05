@@ -174,6 +174,7 @@ keyword argument in `authenticate()`.
 | `--port` | `port` | `1812` | RADIUS authentication UDP port. |
 | `--identity` | `identity` | `"anonymous"` | Outer EAP identity (the name sent in the clear, before the tunnel). |
 | `--password` | `password` | `None` | Password, used by TTLS/PAP, PEAP-MSCHAPv2, bare MSCHAPv2 and plain PAP. |
+| `--password-encoding` | `password_encoding` | `"utf-8"` | Encoding for the cleartext password on the wire (plain PAP, TTLS-PAP, EAP-GTC). Use e.g. `cp1250` to mimic Windows supplicants that send accented passwords in the local ANSI code page. Does not affect MSCHAPv2 (always UTF-16LE) or the identity (always UTF-8). |
 | `--auth` | `auth` | `"auto"` | Outermost method: `auto`, `peap`, `ttls`, `tls`, `mschapv2`, `pap`, `none` (see [Authentication methods](#authentication-methods)). |
 | `--inner-auth` | `inner_auth` | `"eap"` | Inner authentication: `eap`, `pap`, `none` (see [Inner authentication](#inner-authentication)). |
 | `--inner-identity` | `inner_identity` | `None` → falls back to `identity` | The real identity sent *inside* the tunnel. |
@@ -272,6 +273,13 @@ The certificate chain is printed regardless of the outcome, using the
   (rare) that would not fit in a single RADIUS packet are not split.
 - Inside TTLS, PAP sends the password in cleartext **inside** the TLS tunnel, as per
   RFC 5281.
+- **Password character encoding.** The cleartext password (plain PAP, TTLS-PAP,
+  EAP-GTC) is sent as UTF-8 by default. RADIUS does not mandate a charset for the
+  password octets (RFC 8044 makes *text* attributes like User-Name UTF-8, but the
+  password is opaque *string* octets), so real clients differ: Windows supplicants
+  typically send accented passwords in the local ANSI code page (e.g. CP1250).
+  Use `--password-encoding` / `password_encoding=` to match them. Identities are
+  always UTF-8 (RFC 8044 / RFC 7542 NAI); MSCHAPv2 always uses UTF-16LE (RFC 2759).
 
 ## License
 

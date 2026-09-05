@@ -168,11 +168,13 @@ def _radius_encrypt_password(password: bytes, secret: bytes, authenticator: byte
 
 
 def build_pap_access_request(radius_id: int, secret: bytes, username: str, password: str,
-                             nas_ip: str, extra_attrs: list[tuple[int, bytes]] | None = None) -> bytes:
+                             nas_ip: str, extra_attrs: list[tuple[int, bytes]] | None = None,
+                             encoding: str = "utf-8") -> bytes:
     """Plain RADIUS PAP Access-Request (no EAP): User-Name + (encrypted)
-    User-Password, + Message-Authenticator (RFC 3579)."""
+    User-Password, + Message-Authenticator (RFC 3579). The password is encoded
+    with `encoding` (default UTF-8); User-Name stays UTF-8 (RFC 8044 text)."""
     authenticator = os.urandom(16)
-    enc_pw = _radius_encrypt_password(password.encode(), secret, authenticator)
+    enc_pw = _radius_encrypt_password(password.encode(encoding), secret, authenticator)
     attrs: list[tuple[int, bytes]] = [
         (ATTR_USER_NAME, username.encode()),
         (2, enc_pw),  # User-Password
@@ -438,8 +440,8 @@ def ttls_avp_parse(data: bytes) -> list[tuple[int, int, int | None, bytes]]:
     return avps
 
 
-def ttls_pap_avps(username: str, password: str) -> bytes:
-    pw = password.encode()
+def ttls_pap_avps(username: str, password: str, encoding: str = "utf-8") -> bytes:
+    pw = password.encode(encoding)
     pad = (-len(pw)) % 16  # null-pad to a multiple of 16 (RFC 5281)
     pw += b"\x00" * pad
     return ttls_avp(AVP_USER_NAME, username.encode()) + ttls_avp(AVP_USER_PASSWORD, pw)
@@ -993,10 +995,10 @@ class RadiusConversation:
             f"No reply from the RADIUS server ({self.server}:{self.port}) after {retries} attempts"
         ) from last_err
 
-    def send_pap(self, username: str, password: str, retries: int = 3):
+    def send_pap(self, username: str, password: str, retries: int = 3, encoding: str = "utf-8"):
         packet = build_pap_access_request(
             self._next_radius_id(), self.secret, username, password, self.nas_ip,
-            extra_attrs=self.extra_attrs,
+            extra_attrs=self.extra_attrs, encoding=encoding,
         )
         if self.debug:
             log(f"--> Access-Request PAP ({len(packet)} byte), User-Name={username}", file=sys.stderr)
@@ -1209,7 +1211,7 @@ def run_tunnel(conv: RadiusConversation, eap_type: int, start_frame: EapPeapFram
                     pending_out = b""
                 elif args.inner_auth == "pap":
                     log(f"TTLS/PAP: sending User-Name='{inner_identity}' + User-Password...")
-                    pending_out = tunnel.write_app(ttls_pap_avps(inner_identity, args.password or ""))
+                    pending_out = tunnel.write_app(ttls_pap_avps(inner_identity, args.password or "", args.password_encoding))
                 else:  # TTLS + inner EAP: the client initiates with an Identity Response
                     pending_out = inner_send(eap_type, tunnel, 1, EAP_TYPE_IDENTITY, inner_identity.encode())
                 continue
@@ -1303,7 +1305,7 @@ def run_tunnel(conv: RadiusConversation, eap_type: int, start_frame: EapPeapFram
         if itype == EAP_TYPE_GTC and args.password is not None:
             if args.debug:
                 log("    [inner] EAP-GTC response: sending cleartext password", file=sys.stderr)
-            pending_out = inner_send(eap_type, tunnel, iident, EAP_TYPE_GTC, args.password.encode())
+            pending_out = inner_send(eap_type, tunnel, iident, EAP_TYPE_GTC, args.password.encode(args.password_encoding))
             continue
         if args.password is not None and not tried_gtc_switch and itype not in (EAP_TYPE_GTC, EAP_TYPE_MSCHAPV2):
             # The server offers a method we do not handle (e.g. capabilities/254
@@ -1393,6 +1395,7 @@ def authenticate(
     port=1812,
     identity="anonymous",
     password=None,
+    password_encoding="utf-8",
     auth="auto",
     inner_auth="eap",
     inner_identity=None,
@@ -1422,7 +1425,7 @@ def authenticate(
     """
     args = argparse.Namespace(
         server=server, secret=secret, port=port, identity=identity,
-        password=password, auth=auth, inner_auth=inner_auth,
+        password=password, password_encoding=password_encoding, auth=auth, inner_auth=inner_auth,
         inner_identity=inner_identity, sni=sni, ca_cert=ca_cert,
         unsafe_cert=unsafe_cert, timeout=timeout, source_ip=source_ip,
         nas_ip=nas_ip, probe_methods=probe_methods, allow_tls13=allow_tls13,
@@ -1440,6 +1443,10 @@ def authenticate(
 
 
 def probe(server, args, nas_ip, extra_attrs) -> tuple[str, str]:
+    try:
+        "".encode(args.password_encoding)
+    except LookupError:
+        raise ValueError(f"unknown --password-encoding: {args.password_encoding!r}")
     conv = RadiusConversation(
         server, args.port, args.secret, nas_ip, args.timeout,
         source_ip=args.source_ip, extra_attrs=extra_attrs, debug=args.debug,
@@ -1452,7 +1459,7 @@ def probe(server, args, nas_ip, extra_attrs) -> tuple[str, str]:
         if not args.password:
             raise RuntimeError("--auth pap needs --password (and --identity is the username).")
         log(f"Plain RADIUS PAP (no EAP), User-Name={args.identity}")
-        code, attrs = conv.send_pap(args.identity, args.password or "")
+        code, attrs = conv.send_pap(args.identity, args.password or "", encoding=args.password_encoding)
         if code == ACCESS_ACCEPT:
             log(f"\n>> ACCESS-ACCEPT (PAP succeeded, the password is correct). {accept_diagnostics(attrs)}")
             return RESULT_ACCESS, "Access-Accept: PAP authentication succeeded"
@@ -1569,6 +1576,11 @@ def main() -> None:
                         "'pap' (TTLS only: User-Name+User-Password AVP), 'none' (cert+tunnel only).")
     p.add_argument("--inner-identity", default=None, help="Inner (real) identity; default: --identity")
     p.add_argument("--password", default=None, help="Password for TTLS/PAP/MSCHAPv2")
+    p.add_argument("--password-encoding", dest="password_encoding", default="utf-8",
+                   help="Character encoding for the cleartext PASSWORD on the wire (PAP and "
+                        "EAP-GTC). Default: utf-8. Use e.g. cp1250 to match Windows supplicants "
+                        "that send accented passwords in the local ANSI code page. Does not affect "
+                        "MSCHAPv2 (fixed UTF-16LE) or the identity (UTF-8).")
     p.add_argument("--probe-methods", action="store_true",
                    help="For inner EAP, walk through the candidate methods with Nak and report what the "
                         "server offers.")
