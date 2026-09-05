@@ -66,6 +66,50 @@ except ImportError:
 log = print
 
 
+def set_logger(target=print):
+    """Route all log output to a single sink and return the previous logger.
+
+    target may be:
+      * None       - discard everything (quiet; errors still come back in the
+                     (state, message) returned by authenticate())
+      * print      - the builtin (default), writing to stdout
+      * a callable - called as target(message) once per line (e.g.
+                     logging.getLogger("radprobe").info)
+      * a stream   - any object with .write (sys.stdout, sys.stderr, an open
+                     file); each line is written with a trailing newline
+      * a str      - a filename, opened in append mode (UTF-8), line-flushed;
+                     it is not closed explicitly (for long-lived processes pass
+                     a stream you manage yourself instead)
+
+    There is a single stream of messages (no stdout/stderr split). Debug-level
+    lines are only produced when debug is enabled (the --debug flag); they go to
+    the same sink as the normal (info) lines.
+    """
+    global log
+    prev = log
+    if target is None:
+        log = lambda *a, **k: None
+    elif target is print:
+        log = print
+    elif callable(target) and not hasattr(target, "write"):
+        def log(*args, **k):
+            target(" ".join(str(a) for a in args))
+    elif hasattr(target, "write"):
+        def log(*args, **k):
+            target.write(" ".join(str(a) for a in args) + "\n")
+            flush = getattr(target, "flush", None)
+            if flush:
+                flush()
+    elif isinstance(target, str):
+        _fh = open(target, "a", encoding="utf-8")
+        def log(*args, **k):
+            _fh.write(" ".join(str(a) for a in args) + "\n")
+            _fh.flush()
+    else:
+        raise TypeError(f"set_logger: unsupported target type {type(target).__name__}")
+    return prev
+
+
 # ---------------------------------------------------------------------------
 # Result states returned by probe() / run_tunnel() / run_bare_mschapv2(). Each
 # of these returns a (state, message) tuple and never raises: state is one of
@@ -975,14 +1019,14 @@ class RadiusConversation:
         )
         if self.debug:
             log(f"--> Access-Request ({len(packet)} byte)\n    EAP ({len(eap_packet)} byte): "
-                  f"{eap_packet[:48].hex(' ')}...", file=sys.stderr)
+                  f"{eap_packet[:48].hex(' ')}...")
         last_err = None
         for _ in range(retries):
             try:
                 self.sock.sendto(packet, (self.server, self.port))
                 data, _addr = self.sock.recvfrom(65535)
                 if self.debug:
-                    log(f"<-- reply ({len(data)} bytes, code={data[0]})", file=sys.stderr)
+                    log(f"<-- reply ({len(data)} bytes, code={data[0]})")
                 code, ident, auth, attrs = parse_radius_packet(data)
                 new_state = get_state(attrs)
                 if new_state is not None:
@@ -1001,14 +1045,14 @@ class RadiusConversation:
             extra_attrs=self.extra_attrs, encoding=encoding,
         )
         if self.debug:
-            log(f"--> Access-Request PAP ({len(packet)} byte), User-Name={username}", file=sys.stderr)
+            log(f"--> Access-Request PAP ({len(packet)} byte), User-Name={username}")
         last_err = None
         for _ in range(retries):
             try:
                 self.sock.sendto(packet, (self.server, self.port))
                 data, _addr = self.sock.recvfrom(65535)
                 if self.debug:
-                    log(f"<-- reply ({len(data)} bytes, code={data[0]})", file=sys.stderr)
+                    log(f"<-- reply ({len(data)} bytes, code={data[0]})")
                 code, ident, auth, attrs = parse_radius_packet(data)
                 return code, attrs
             except socket.timeout as e:
@@ -1073,12 +1117,11 @@ def run_tunnel(conv: RadiusConversation, eap_type: int, start_frame: EapPeapFram
     if verify and not check_host:
         log("WARNING: cert verification = ONLY the chain (signed by a trusted CA); the server "
               "NAME is NOT verified. So any validly-signed cert would be accepted before the "
-              "password is sent. For auth testing pass --sni <expected-name> (see the cert SAN below).",
-              file=sys.stderr)
+              "password is sent. For auth testing pass --sni <expected-name> (see the cert SAN below).")
     elif verify and check_host:
-        log(f"Cert verification: chain + hostname ({hostname}).", file=sys.stderr)
+        log(f"Cert verification: chain + hostname ({hostname}).")
     else:
-        log("Cert verification: DISABLED (--unsafe-cert).", file=sys.stderr)
+        log("Cert verification: DISABLED (--unsafe-cert).")
     cert_capture = bytearray()
     inner_identity = args.inner_identity or args.identity
 
@@ -1097,7 +1140,7 @@ def run_tunnel(conv: RadiusConversation, eap_type: int, start_frame: EapPeapFram
 
     if len(pending_out) > 3500:
         log("WARNING: the outgoing TLS flight is >3500 bytes and may not fit in a single "
-              "RADIUS packet (outgoing EAP fragmentation is not implemented).", file=sys.stderr)
+              "RADIUS packet (outgoing EAP fragmentation is not implemented).")
 
     while True:
         # 1) Send the current outgoing TLS/tunnel data as a reply to server_frame
@@ -1192,7 +1235,7 @@ def run_tunnel(conv: RadiusConversation, eap_type: int, start_frame: EapPeapFram
                         )
                     if m is None:
                         log("WARNING: the hostname cannot be checked (could not extract a name "
-                              "from the cert), relying only on chain verification.", file=sys.stderr)
+                              "from the cert), relying only on chain verification.")
 
                 v, c = tunnel.version(), tunnel.cipher()
                 log(f"TLS tunnel established: {v}, cipher: {c[0] if c else '?'}")
@@ -1221,7 +1264,7 @@ def run_tunnel(conv: RadiusConversation, eap_type: int, start_frame: EapPeapFram
         # ---- inner phase: server_tls is encrypted tunnel data ----
         plain = tunnel.read_app(server_tls)
         if args.debug and plain:
-            log(f"    [inner] decrypted {len(plain)} bytes: {plain[:64].hex(' ')}", file=sys.stderr)
+            log(f"    [inner] decrypted {len(plain)} bytes: {plain[:64].hex(' ')}")
 
         if eap_type == EAP_TYPE_TTLS and args.inner_auth == "pap":
             # The PAP result usually comes as an outer Accept/Reject (handled above).
@@ -1266,7 +1309,7 @@ def run_tunnel(conv: RadiusConversation, eap_type: int, start_frame: EapPeapFram
                     break
             if nxt is not None:
                 if args.debug:
-                    log(f"    [inner] Nak -> {EAP_TYPE_NAMES.get(nxt, nxt)} ({nxt})", file=sys.stderr)
+                    log(f"    [inner] Nak -> {EAP_TYPE_NAMES.get(nxt, nxt)} ({nxt})")
                 pending_out = inner_send(eap_type, tunnel, iident, EAP_TYPE_NAK, bytes([nxt]))
                 continue
             log(f"\n>> Probing done. Observed inner methods: {_fmt_types(offered)}")
@@ -1297,14 +1340,14 @@ def run_tunnel(conv: RadiusConversation, eap_type: int, start_frame: EapPeapFram
                     log(">> Inner MSCHAPv2 Success, but the server's 'S=' response could not "
                           "be verified.")
             elif args.debug:
-                log("    [inner] MSCHAPv2 challenge -> response", file=sys.stderr)
+                log("    [inner] MSCHAPv2 challenge -> response")
             pending_out = inner_send(eap_type, tunnel, iident, EAP_TYPE_MSCHAPV2, msdata)
             continue
 
         # Actually complete a cleartext-password method if --password is given:
         if itype == EAP_TYPE_GTC and args.password is not None:
             if args.debug:
-                log("    [inner] EAP-GTC response: sending cleartext password", file=sys.stderr)
+                log("    [inner] EAP-GTC response: sending cleartext password")
             pending_out = inner_send(eap_type, tunnel, iident, EAP_TYPE_GTC, args.password.encode(args.password_encoding))
             continue
         if args.password is not None and not tried_gtc_switch and itype not in (EAP_TYPE_GTC, EAP_TYPE_MSCHAPV2):
@@ -1533,7 +1576,7 @@ def probe(server, args, nas_ip, extra_attrs) -> tuple[str, str]:
     eap_type = frame.eap_type
     log(f"Detected EAP type: {SUPPORTED_TLS_TUNNEL_TYPES[eap_type]} (type number {eap_type})")
     if not (frame.flags & FLAG_START):
-        log("WARNING: no Start flag in the first reply, continuing anyway.", file=sys.stderr)
+        log("WARNING: no Start flag in the first reply, continuing anyway.")
 
     if eap_type == EAP_TYPE_TTLS and args.inner_auth == "pap" and not args.password:
         raise RuntimeError("TTLS/PAP needs --password (and --inner-identity is advisable).")
@@ -1597,7 +1640,7 @@ def main() -> None:
 
     state, message = authenticate(**vars(args))
     if state == RESULT_ERROR:
-        log(f"ERROR: {message}", file=sys.stderr)
+        log(f"ERROR: {message}")
     sys.exit({RESULT_ACCESS: 0, RESULT_REJECT: 1, RESULT_NOAUTH: 0, RESULT_ERROR: 2}.get(state, 2))
 
 

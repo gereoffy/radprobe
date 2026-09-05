@@ -73,9 +73,10 @@ python3 radprobe.py --server <ip> --secret <psk> [options]
 `--server` and `--secret` are required; everything else is optional (see the
 [Parameters](#parameters) table). Run with `--help` for the built-in summary.
 
-The tool prints a human-readable trace of the exchange to stdout (diagnostics and
-warnings go to stderr) and exits with a status code (see
-[Result states & exit codes](#result-states--exit-codes)).
+The tool prints a human-readable trace of the exchange to stdout (all messages go
+to one place; there is no separate stderr channel) and exits with a status code
+(see [Result states & exit codes](#result-states--exit-codes)). With `--debug`
+extra debug-level lines are added to the same output.
 
 ### Examples
 
@@ -161,6 +162,32 @@ handle exceptions yourself.
 
 ---
 
+## Logging
+
+By default all messages are printed with the builtin `print`. To redirect or
+silence them, call `set_logger(target)` before `authenticate()`:
+
+```python
+import logging, sys
+from radprobe import authenticate, set_logger
+
+set_logger(None)                                   # discard everything (quiet)
+set_logger(sys.stderr)                             # any stream (.write)
+set_logger("radprobe.log")                         # append to a file (UTF-8)
+set_logger(logging.getLogger("radprobe").info)     # a callback(message)
+set_logger(print)                                  # back to the default
+```
+
+`set_logger()` accepts `None`, the builtin `print`, any stream object (something
+with a `.write`, e.g. `sys.stdout`/`sys.stderr`/an open file), a filename string
+(opened in append mode, UTF-8, line-flushed), or any callable taking a single
+message string. It returns the previous logger, so you can restore it.
+
+There is a single stream of messages, no stdout/stderr split. Debug-level lines
+(the RADIUS traffic dump) are only produced when `debug=True` / `--debug`, and
+they go to the same sink as the normal lines. With `set_logger(None)`, nothing is
+printed and any error is still returned in the `message` from `authenticate()`.
+
 ## Parameters
 
 The CLI flags and the `authenticate()` keyword arguments are the same thing under
@@ -190,7 +217,7 @@ keyword argument in `authenticate()`.
 | `--nas-port-type` | `nas_port_type` | `None` | Optional NAS-Port-Type attribute (e.g. `19` = Wireless-802.11). |
 | `--calling-station-id` | `calling_station_id` | `None` | Optional Calling-Station-Id attribute (e.g. a MAC address). |
 | `--framed-protocol` | `framed_protocol` | `None` | Optional Framed-Protocol attribute (integer). |
-| `--debug` | `debug` | `False` | Print a short dump of the RADIUS traffic to stderr. |
+| `--debug` | `debug` | `False` | Add a short dump of the RADIUS traffic to the log output (debug level). |
 | *(library only)* | `extra_attrs` | `None` | A list of raw `(type, value_bytes)` RADIUS attributes appended after the ones built from `service_type` / `nas_port_type` / `calling_station_id` / `framed_protocol`. |
 
 ---
@@ -235,7 +262,7 @@ constants), and the CLI maps them to a process exit code:
 | `"access"` | `RESULT_ACCESS` | `0` | Server accepted (Access-Accept / EAP-Success). |
 | `"reject"` | `RESULT_REJECT` | `1` | Server rejected (Access-Reject / EAP-Failure / wrong password). |
 | `"noauth"` | `RESULT_NOAUTH` | `0` | Ran successfully, but no authentication was attempted (cert-only, method probe, or a non-tunnel offer with no password). |
-| `"error"` | `RESULT_ERROR` | `2` | Could not complete: network timeout, TLS/certificate problem, configuration, or protocol error. On the CLI the message is printed to stderr. |
+| `"error"` | `RESULT_ERROR` | `2` | Could not complete: network timeout, TLS/certificate problem, configuration, or protocol error. On the CLI the message is printed to the log output. |
 
 The second element of the tuple, `message`, is a short human-readable summary
 suitable for showing to a user.
