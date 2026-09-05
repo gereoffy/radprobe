@@ -19,3 +19,11 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+This software was developed with the assistance of Claude, an AI assistant made
+by Anthropic (working from an earlier certificate-probe script that was itself
+produced with Claude). Under Anthropic's terms, rights in the AI-generated
+output are assigned to the copyright holder named above; this acknowledgment is
+a courtesy credit and is not a copyright claim by Anthropic or Claude.
